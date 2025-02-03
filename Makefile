@@ -1,14 +1,14 @@
 all: CPP cc cc0 \
-     cc1.8080 cc1.z80 cc1.thread cc1.byte cc1.6502 \
+     cc1.8080 cc1.z80 cc1.thread cc1.byte \
      cc1.65c816 cc1.z8 cc1.1802 cc1.6800 cc1.6809 \
      cc1.8070 cc1.8086 \
      cc1.ee200 cc1.nova cc1.ddp cc1.7000 cc1.hc08 cc1.gb \
      cc2 cc2.8080 cc2.z80 cc2.65c816 cc2.thread \
-     cc2.6502 cc2.z8 cc2.super8 cc2.1802 cc2.6800 cc2.6809 \
+     cc2.z8 cc2.super8 cc2.1802 cc2.6800 cc2.6809 \
      cc2.8070 cc2.8086 \
      cc2.ee200 cc2.nova cc2.ddp cc2.7000 cc2.hc08 cc2.gb \
      copt \
-     support6303 support6502 support65c816 support6800 support6803 \
+     support6303 support65c816 support6800 support6803 \
      support6809 support68hc11 support8070 support8080 support8085 supportz80 \
      supportz8 supportsuper8 supportee200 supportnova supportnova3 supporttms7000 \
      test
@@ -442,64 +442,21 @@ bootinst:
 #	Install the support libraries
 #
 libinst:
-	cp support6502/crt0.o $(CCROOT)/lib/6502/
-	cp support6502/lib6502.a $(CCROOT)/lib/6502/lib6502.a
-#	cp support6502/lib65c02.a $(CCROOT)/lib/6502/lib65c02.a
-	ar cq $(CCROOT)/lib/6502/libc.a
-	cp support65c816/crt0.o $(CCROOT)/lib/65c816/
-	cp support65c816/lib65c816.a $(CCROOT)/lib/65c816/lib65c816.a
-	ar cq $(CCROOT)/lib/65c816/libc.a
 	cp support6303/crt0.o $(CCROOT)/lib/6303/
 	cp support6303/lib6303.a $(CCROOT)/lib/6303/lib6303.a
-	ar cq $(CCROOT)/lib/6800/libc.a
-	cp support6800/crt0.o $(CCROOT)/lib/6800/
-	cp support6800/lib6800.a $(CCROOT)/lib/6800/lib6800.a
-	ar cq $(CCROOT)/lib/6800/libc.a
-	cp support6803/crt0.o $(CCROOT)/lib/6803/
-	cp support6803/lib6803.a $(CCROOT)/lib/6803/lib6803.a
-	ar cq $(CCROOT)/lib/6803/libc.a
-	cp support6809/crt0.o $(CCROOT)/lib/6809/
-	cp support6809/lib6809.a $(CCROOT)/lib/6809/lib6809.a
-	ar cq $(CCROOT)/lib/6809/libc.a
-	cp support68hc11/crt0.o $(CCROOT)/lib/hc11/
-	cp support68hc11/lib68hc11.a $(CCROOT)/lib/hc11/libhc11.a
-	ar cq $(CCROOT)/lib/hc11/libc.a
 	cp support8070/crt0.o $(CCROOT)/lib/8070/
 	cp support8070/include/*.h $(CCROOT)/lib/8070/include/
 	cp support8070/lib8070.a $(CCROOT)/lib/8070/lib8070.a
-	cp support8080/crt0.o $(CCROOT)/lib/8080/
 	cp support8085/crt0.o $(CCROOT)/lib/8085/
-	cp support8080/include/*.h $(CCROOT)/lib/8080/include/
 	cp support8085/include/*.h $(CCROOT)/lib/8085/include/
-	cp support8080/lib8080.a $(CCROOT)/lib/8080/lib8080.a
 	cp support8085/lib8085.a $(CCROOT)/lib/8085/lib8085.a
-	ar cq $(CCROOT)/lib/8080/libc.a
-	cp supportz8/crt0.o $(CCROOT)/lib/z8/
-	cp supportz8/include/*.h $(CCROOT)/lib/z8/include/
-	cp supportz8/libz8.a $(CCROOT)/lib/z8/libz8.a
-	ar cq $(CCROOT)/lib/z8/libc.a
-	cp supportee200/crt0.o $(CCROOT)/lib/ee200/
-	cp supportee200/libee200.a $(CCROOT)/lib/ee200/libee200.a
-	ar cq $(CCROOT)/lib/ee200/libc.a
 	cp supportnova3/crt0.o $(CCROOT)/lib/nova/
 	cp supportnova3/include/*.h $(CCROOT)/lib/nova/include/
 	cp supportnova3/libnova.a $(CCROOT)/lib/nova/libnova3.a
-	cp supportnova/crt0.o $(CCROOT)/lib/nova/
-	cp supportnova/include/*.h $(CCROOT)/lib/nova/include/
-	cp supportnova/libnova.a $(CCROOT)/lib/nova/libnova.a
-	ar cq $(CCROOT)/lib/nova/libc.a
-	cp supportsuper8/crt0.o $(CCROOT)/lib/super8/
-	cp supportsuper8/include/*.h $(CCROOT)/lib/super8/include/
-	cp supportsuper8/libsuper8.a $(CCROOT)/lib/super8/libsuper8.a
-	ar cq $(CCROOT)/lib/super8/libc.a
 	cp supporttms7000/crt0.o $(CCROOT)/lib/tms7000/
 	cp supporttms7000/include/*.h $(CCROOT)/lib/tms7000/include/
 	cp supporttms7000/libtms7000.a $(CCROOT)/lib/tms7000/libtms7000.a
 	cp support8080/crt0.o $(CCROOT)/lib/8080/
-	cp supportz80/crt0.o $(CCROOT)/lib/z80/
-	cp supportz80/include/*.h $(CCROOT)/lib/z80/include/
-	cp supportz80/libz80.a $(CCROOT)/lib/z80/libz80.a
-	ar cq $(CCROOT)/lib/z80/libc.a
 
 #
 #	Build the tools then install them
