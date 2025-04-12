@@ -1,6 +1,6 @@
 all: lib8070.a crt0.o
 
-OBJ = __bool.o __cc.o __castc_.o __cast_l.o __castu_ul.o \
+OBJ = __bool.o __cc.o __castc_.o __cast_l.o \
       __cceq.o __ccne.o __ccgt.o __ccgteq.o __cclt.o __cclteq.o \
       __ccgtu.o __ccgtequ.o __ccltu.o __ccltequ.o \
       __shl.o __shr.o __shleq.o __shreq.o __shleqc.o __shrequc.o \
