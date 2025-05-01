@@ -321,7 +321,7 @@ struct node *bool_tree(register struct node *n, unsigned flags)
 }
 
 /* Calculate arithmetic promotion */
-static unsigned arith_pro(unsigned lt, unsigned rt)
+static unsigned arith_pro(register unsigned lt, register unsigned rt)
 {
 	/* Turn pointers to matching target specific integer type */
 	if (PTR(lt))
@@ -329,15 +329,15 @@ static unsigned arith_pro(unsigned lt, unsigned rt)
 	if (PTR(rt))
 		rt = target_ptr;
 	/* Our types are ordered for a reason */
-	/* Does want review versus standard TODO */
-	if (rt > lt)
-		lt = rt;
+	/* sub integer sized objects get evaluated as integer or larger */
 	if (lt < CINT)
 		lt = CINT;
-	if (lt < FLOAT) {
-		if((rt | lt) & UNSIGNED)
-			lt |= UNSIGNED;
-	}
+	if (rt < CINT)
+		rt = CINT;
+	/* Return the largest type. In a tie by type code the unsigned bit is
+	   the bit below so unsigned wins. We never have FLOAT|UNSIGNED */
+	if (rt > lt)
+		return rt;
 	return lt;
 }
 
@@ -375,9 +375,10 @@ struct node *intarith_tree(register unsigned op, register struct node *l, regist
 	if (!IS_INTARITH(lt) || !IS_INTARITH(rt))
 		badtype();
 	if (op == T_LTLT || op == T_GTGT) {
-		lt = arith_pro(lt, lt);
+		/* Promote the left side if needed be (eg it's char/uchar) */
+		rt = arith_pro(lt, lt);
 		if (lt != rt)
-			l = make_cast(l, lt);
+			l = make_cast(l, rt);
 		return typed_tree(op, lt, l, make_cast(r, CINT));
 	} else
 		return arith_pro_tree(op, l, r);
