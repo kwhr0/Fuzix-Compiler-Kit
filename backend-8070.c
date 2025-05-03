@@ -22,11 +22,25 @@
  *	  can be used in many ways (eg folding together *x++)
  *
  *	TODO:
- *	- Lots of basics to get working yet
+ *	- Fold together all the condition helpers for byte/word
  *	- Rewrite x++ and --x forms to use autoindexing
- *	- Implement register tracking
+ *	- Byte sized ++/-- optimizations
+ *	- Shift >> or << 16 optimization (and maybe >=16 as it's then a
+ *	  standard sized shift if we set up right for >> unsigned)
+ *	- Implement register tracking (in progress)
+ *		Need to do pointer tracking an EA node tracking for ptr
+ *		and word sized refs.
+ *		Need to enable LREF/LSTORE etc for dword
+ *	- Optimised pushing for args (push long, push lref)
+ *	- CCONLY
+ *	- Comparisons using CCONLY
+ *	- Check longer refs with offset are ok (using ptr/ea xch trick should
+ *	  mean they are). Move more stuf to gen_ref with offset and fold in
+ *	  additions
+ *	- Byteops (good test case)
  *	- Peepholes
- *	- Lots of support routines
+ *	- Can we do some equality type comparisons better inline with something
+ *	  like sub ea,blah jsr bool/bang ?
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -34,11 +48,24 @@
 #include <string.h>
 #include "compiler.h"
 #include "backend.h"
+#include "backend-byte.h"
 
 #define ARGBASE		2
 
 #define BYTE(x)		(((unsigned)(x)) & 0xFF)
 #define WORD(x)		(((unsigned)(x)) & 0xFFFF)
+
+#define T_NREF		(T_USER)		/* Load of C global/static */
+#define T_CALLNAME	(T_USER+1)		/* Function call by name */
+#define T_NSTORE	(T_USER+2)		/* Store to a C global/static */
+#define T_LREF		(T_USER+3)		/* Ditto for local */
+#define T_LSTORE	(T_USER+4)
+#define T_LBREF		(T_USER+5)		/* Ditto for labelled strings or local static */
+#define T_LBSTORE	(T_USER+6)
+#define T_DEREFPLUS	(T_USER+7)		/* *(thing + offset) */
+#define T_LDEREF	(T_USER+8)		/* *local + offset */
+#define T_LEQ		(T_USER+9)		/* *local + offset = n*/
+#define T_EQPLUS	(T_USER+10)		/* *(ac + n) = m */
 
 /*
  *	State for the current function
@@ -47,6 +74,7 @@ static unsigned frame_len;	/* Number of bytes of stack frame */
 static unsigned sp;		/* Stack pointer offset tracking */
 static unsigned unreachable;	/* Track unreachable code state */
 static unsigned func_cleanup;	/* Zero if we can just ret out */
+static unsigned label;		/* Used for local branches */
 
 static unsigned get_size(unsigned t)
 {
@@ -83,12 +111,15 @@ static unsigned get_stack_size(unsigned t)
 
 static uint8_t a_value;
 static uint8_t e_value;
-static uint8_t t_value;
+static uint16_t t_value;
+static uint16_t hireg_value;
 static unsigned a_valid;
 static unsigned e_valid;
 static unsigned t_valid;
 static unsigned ea_valid;
+static unsigned hireg_valid;
 static struct node ea_node;
+static struct node t_node;
 static struct node p_node[2];	/* P2 and P3 */
 static unsigned p_valid[2];
 
@@ -134,12 +165,54 @@ void set_ea(unsigned n)
 	ea_valid = 0;	/* No valid node */
 }
 
+unsigned map_op(register unsigned op)
+{
+	switch(op) {
+	case T_LSTORE:
+		op = T_LREF;
+	case T_LREF:
+		break;
+	case T_LBSTORE:
+		op = T_LBREF;
+	case T_LBREF:
+		break;
+	case T_NSTORE:
+		op = T_NREF;
+	case T_NREF:
+		break;
+	case T_NAME:
+	case T_LABEL:
+	case T_LOCAL:
+		break;
+	/* Don't do other matches for now */
+	default:
+		return 0;
+	}
+	return op;
+}
+
 void set_ea_node(struct node *n)
 {
 	a_valid = 0;
 	e_valid = 0;
 	ea_valid = 1;
 	memcpy(&ea_node, n, sizeof(ea_node));
+	ea_node.op = map_op(ea_node.op);
+	printf(";set_ea_node from %02X to %02X\n", n->op, ea_node.op);
+}
+
+unsigned is_ea_node(struct node *n)
+{
+	unsigned op;
+	if (ea_valid == 0)
+		return 0;
+	op = map_op(n->op);
+	printf(";is_ea_node op %04X node op %04X, val %08lX, node val %08lX\n",
+		op, ea_node.op, n->value, ea_node.value);
+	if (ea_node.op == op && ea_node.value == n->value &&
+		ea_node.type == n->type)
+		return 1;
+	return 0;
 }
 
 void adjust_a(unsigned n)
@@ -163,9 +236,20 @@ void set_t(unsigned n)
 	t_valid = 1;
 }
 
+void set_t_node(struct node *n)
+{
+	t_valid = 2;
+	memcpy(&t_node, n, sizeof(ea_node));
+}
+
 void invalidate_t(void)
 {
 	t_valid = 0;
+}
+
+void invalidate_hireg(void)
+{
+	hireg_valid = 0;
 }
 
 void flush_writeback(void)
@@ -175,9 +259,53 @@ void flush_writeback(void)
 void invalidate_all(void)
 {
 	t_valid = 0;
+	hireg_valid = 0;
 	p_valid[0] = 0;
 	p_valid[1] = 0;
 	invalidate_ea();
+	printf(";invalidate all\n");
+}
+
+static unsigned ea_is(unsigned v)
+{
+	v &= 0xFFFF;
+	if (a_valid && e_valid && a_value == (v & 0xFF) && e_value == (v >> 8))
+		return 1;
+	return 0;
+}
+
+void load_ea_hireg(void)
+{
+	if (hireg_valid) {
+		if (ea_is(hireg_value))
+			return;
+		puts("\tld ea,:__hireg");
+		set_ea(hireg_value);
+		printf(";load ea hireg ea now %d %d %02X%02X\n", e_valid,
+			a_valid, e_value, a_value);
+	} else {
+		puts("\tld ea,:__hireg");
+		invalidate_ea();
+	}
+}
+
+void store_ea_hireg(void)
+{
+	uint16_t val = (e_value << 8) | a_value;
+	/* hireg already holds this value */
+	printf(";st ea hireg\n");
+	if (a_valid && e_valid) {
+		if (hireg_valid && val == hireg_value)
+			return;
+		puts("\tst ea,:__hireg");
+		/* If EA is known then hireg is now known */
+		hireg_value = (e_value << 8) | a_value;
+		hireg_valid = 1;
+		printf(";hireg now %04X\n", val);
+	} else {
+		puts("\tst ea,:__hireg");
+		hireg_valid = 0;
+	}
 }
 
 void invalidate_p(unsigned p)
@@ -186,21 +314,75 @@ void invalidate_p(unsigned p)
 		p_valid[p - 2] = 0;
 }
 
+void load_t_ea(void)
+{
+	if (t_valid == 1 && ea_is(t_value))
+		return;
+	if (ea_valid)
+		set_t_node(&ea_node);
+	else if (e_valid && a_valid)
+		set_t((e_value << 8) | a_value);
+	else
+		invalidate_t();
+	puts("\tld t,ea");
+}
+
+void load_ea_t(void)
+{
+	if (t_valid == 1 && ea_is(t_value))
+		return;
+	if (t_valid == 2)
+		set_ea_node(&t_node);
+	else if (t_valid == 1)
+		set_ea(t_value);
+	else
+		invalidate_ea();
+	puts("\tld ea,t");
+}
+
 unsigned free_pointer_nw(unsigned p)
 {
-	/* Dummy up for now */
 	if (p == 3)
 		return 2;
 	return 3;
 }
 
+/* No space really for being clever so just alternate */
 unsigned free_pointer(void)
 {
-	return 3;
+	static unsigned ptr = 2;
+	ptr ^= 1;
+	return ptr;
 }
 
+/* Also need a find_ptr that turns LSTORE/LREF to LOCAL etc so we can look
+   for the object pointer itself to optimise stuff like ld ea,T%u into
+   ld ea,p3 */
 unsigned find_ref(struct node *n, unsigned nw, unsigned offset, int *off)
 {
+	unsigned op = n->op;
+	switch(op) {
+	case T_LSTORE:
+		op = T_LREF;
+	case T_LREF:
+		break;
+	case T_LBSTORE:
+		op = T_LBREF;
+	case T_LBREF:
+		break;
+	case T_NSTORE:
+		op = T_NREF;
+	case T_NREF:
+		break;
+	default:
+		return 0;
+	}
+	/* TODO: if value is not quite the same check if in off range and
+	   still use it */
+	if (p_valid[0] && p_node[0].op == op && p_node[0].value == n->value)
+		return 2;
+	if (p_valid[1] && p_node[1].op == op && p_node[1].value == n->value)
+		return 3;
 	return 0;
 }
 
@@ -214,17 +396,6 @@ void set_ptr_ref(unsigned p, struct node *n)
 /*
  *	Rewriting
  */
-#define T_NREF		(T_USER)		/* Load of C global/static */
-#define T_CALLNAME	(T_USER+1)		/* Function call by name */
-#define T_NSTORE	(T_USER+2)		/* Store to a C global/static */
-#define T_LREF		(T_USER+3)		/* Ditto for local */
-#define T_LSTORE	(T_USER+4)
-#define T_LBREF		(T_USER+5)		/* Ditto for labelled strings or local static */
-#define T_LBSTORE	(T_USER+6)
-#define T_DEREFPLUS	(T_USER+7)		/* *(thing + offset) */
-#define T_LDEREF	(T_USER+8)		/* *local + offset */
-#define T_LEQ		(T_USER+9)		/* *local + offset = n*/
-#define T_EQPLUS	(T_USER+10)		/* *(ac + n) = m */
 
 static void squash_node(struct node *n, struct node *o)
 {
@@ -276,6 +447,7 @@ static unsigned is_simple(struct node *n)
 
 struct node *gen_rewrite(struct node *top)
 {
+	byte_label_tree(top, BTF_RELABEL);
 	return top;
 }
 
@@ -341,7 +513,8 @@ struct node *gen_rewrite_node(struct node *n)
 		}
 	}
 	/* Rewrite references into a load operation */
-	if (nt == CSHORT || nt == USHORT || nt == CCHAR || nt == UCHAR || PTR(nt)) {
+	if (nt == ULONG || nt == CLONG || nt == CSHORT || nt == USHORT || nt == CCHAR || nt == UCHAR || PTR(nt)) {
+		/* Is this in fact "all" TODO  as we can load/store float fine */
 		if (op == T_DEREF) {
 			if (r->op == T_LOCAL || r->op == T_ARGUMENT) {
 				if (r->op == T_ARGUMENT)
@@ -473,10 +646,10 @@ void gen_cleanup(unsigned size, unsigned save)
 	sp -= size;
 	if (size > 10 + 2 * save) {
 		if (save)
-			printf("\tld t,ea\n");
+			load_t_ea();
 		printf("\tld ea,p1\n\tadd ea,=%d\n\tld p1,ea\n", size);
 		if (save)
-			printf("\tld ea,t\n");
+			load_ea_t();
 		else
 			invalidate_all();
 	} else while(size) {
@@ -619,6 +792,9 @@ void gen_helpclean(struct node *n)
 		/* Caution - for future optimizations:
 		   C style ops that are ISBOOL didn't set the bool flags */
 	}
+	/* E must be 0 as EA = 0/1 */
+	if (n->flags & ISBOOL)
+		set_e(0);
 }
 
 void gen_data_label(const char *name, unsigned align)
@@ -702,8 +878,11 @@ unsigned gen_push(struct node *n)
 		puts("\tpush ea");
 		break;
 	case 4:
-		invalidate_t();
-		puts("\tld t,ea\n\tld ea,:__hireg\n\tpush ea\n\tld ea,t\n\tpush ea");
+		load_t_ea();
+		load_ea_hireg();
+		puts("\tpush ea");
+		load_ea_t();
+		puts("\tpush ea");
 		break;
 	default:
 		return 0;
@@ -721,17 +900,12 @@ unsigned load_ptr_ea(void)
 	return ptr;
 }
 
-static unsigned ea_is(unsigned v)
-{
-	if (a_valid && e_valid && a_value == (v & 0xFF) && e_value == (v >> 8))
-		return 1;
-	return 0;
-}
 
 /* Get a constant into the working register and track it */
 void load_ea(unsigned sz, unsigned long v)
 {
 	unsigned vw = v & 0xFFFF;
+	printf(";load ea %d %08lX\n", sz, v);
 	if (sz == 1) {
 		vw &= 0xFF;
 		if (a_valid && vw == a_value)
@@ -745,15 +919,31 @@ void load_ea(unsigned sz, unsigned long v)
 	else if (sz == 2) {
 		if (ea_is(vw))
 			return;
-		else if (e_valid && e_value == (vw >> 8))
+		if (t_valid == 1 && vw == t_value)
+			puts("\tld ea,t");
+		/* Getting a word out of hireg is cheaper than const load */
+		else if (hireg_valid && vw == hireg_value)
+			load_ea_hireg();
+		/* If we can generate the pair by loading A into E or vice
+		   versa then do so - mostly useful for FFFF and 0000 */
+		else if ((vw >> 8) == (vw & 0xFF)) {
+			if (a_valid && (vw & 0xFF) == a_value)
+				puts("\tld e,a");
+			else if (e_valid && (vw & 0xFF) == e_value)
+				puts("\tld a,e");
+			else
+				printf("\tld ea,=%u\n", vw);
+			set_ea(vw);
+			return;
+		} else if (e_valid && e_value == (vw >> 8))
 			printf("\tld a,=%u\n", vw & 0xFF);
 		else
 			printf("\tld ea,=%u\n", vw);
 		set_ea(vw);
 	} else {
 		load_ea(2, v >> 16);
-		puts("\tst ea,:__hireg");
-		load_ea(2, v);
+		store_ea_hireg();
+		load_ea(2, vw);
 	}
 }
 
@@ -770,10 +960,10 @@ void load_e(unsigned v)
 
 void load_t(unsigned v)
 {
-	if (t_valid && t_value == v)
+	if (t_valid == 1 && t_value == v)
 		return;
 	if (ea_is(v))
-		puts("\tld t,ea");
+		load_t_ea();
 	else
 		printf("\tld t,=%d\n", v & 0xFFFF);
 	set_t(v);
@@ -834,7 +1024,7 @@ unsigned gen_ref_nw(struct node *n, unsigned nw, unsigned offset, int *off)
 		return ptr;
 	/* Make a reference */
 	ptr = free_pointer_nw(nw);
-	if (n->op == T_NREF || n->op == T_NSTORE) { 
+	if (n->op == T_NREF || n->op == T_NSTORE) {
 		printf("\tld p%d,=_%s+%d\n", ptr, namestr(n->snum), v);
 		set_ptr_ref(ptr, n);
 		return ptr;
@@ -882,8 +1072,9 @@ unsigned gen_load_nw(struct node *n, unsigned nw, int offset)
 	else if (sz == 2)
 		printf("\tld ea,%d,p%d\n", off, ptr);
 	else {
+		invalidate_ea();
 		printf("\tld ea,%d,p%d\n", off + 2, ptr);
-		puts("\tst ea,:__hireg");
+		store_ea_hireg();
 		printf("\tld ea,%d,p%d\n", off, ptr);
 	}
 	set_ea_node(n);
@@ -912,7 +1103,7 @@ unsigned gen_load_nw_t(struct node *n, unsigned nw, unsigned offset)
 	/* We have to ref an extra byte */
 	if (sz <= 2)
 		printf("\tld t,%d,p%d\n", off, ptr);
-	else	
+	else
 		error("loadt4");
 	invalidate_t();		/* Not clear any point node tracking T */
 	return 1;
@@ -933,6 +1124,10 @@ static unsigned gen_op(unsigned sz, const char *op, struct node *r)
 {
 	unsigned ptr;
 	int off;
+
+	if (sz == 4)
+		return 0;
+
 	unsigned v = r->value;
 	if (r->op == T_CONSTANT) {
 		/* TODO: op specific set EA value */
@@ -961,6 +1156,10 @@ static unsigned gen_op8(unsigned sz, const char *op, struct node *r)
 	unsigned ptr;
 	int off;
 	unsigned v = r->value;
+
+	if (sz == 4)
+		return 0;
+
 	invalidate_ea();
 	if (r->op == T_CONSTANT) {
 		printf("\t%s a,=%d\n", op, v & 0xFF);
@@ -991,19 +1190,21 @@ static unsigned gen_op8(unsigned sz, const char *op, struct node *r)
    	left shift and MPY by constant >> 1 if constant even
    else helper
  */
-   	
-   	
+
 static unsigned gen_fast_mul(unsigned sz, unsigned value)
 {
 	if (value < 2) {
 		if (value == 0)
-			puts("\tld ea,=0");
+			load_ea(sz, 0);
 		return 1;
 	}
+	if (sz > 2)
+		return 0;
 	if (!(value & ~(value - 1))) {
 		/* Do 8bits of shift by swapping the register about */
 		if (value >= 256) {
-			puts("\txch a,e\n\tld a,=0");
+			puts("\txch a,e\n");
+			load_ea(1, 0);
 			value >>= 8;
 		}
 		/* For each power of two just shift left */
@@ -1018,20 +1219,18 @@ static unsigned gen_fast_mul(unsigned sz, unsigned value)
 	if (sz == 1) {
 		load_t(value);
 		puts("\tmpy ea,t");
-		puts("\tld ea,t");
 		invalidate_t();
 		invalidate_ea();
+		load_ea_t();
 		return 1;
 	}
-	if (sz > 2)
-		return 0;
 	/* Constant on right is positive - can use mpy */
 	if (!(value & 0x8000)) {
 		load_t(value);
 		puts("\tmpy ea,t");
-		puts("\tld ea,t");
 		invalidate_t();
 		invalidate_ea();
+		load_ea_t();
 		return 1;
 	}
 	/* Can't shift to avoid problem - use helper */
@@ -1041,9 +1240,9 @@ static unsigned gen_fast_mul(unsigned sz, unsigned value)
 	puts("\tsl ea");
 	load_t(value >> 1);
 	puts("\tmpy ea,t");
-	puts("\tld ea,t");
 	invalidate_t();
 	invalidate_ea();
+	load_ea_t();
 	return 1;
 }
 
@@ -1074,11 +1273,17 @@ static unsigned access_direct(struct node *n)
  */
 static unsigned op_direct(struct node *n, const char *op, unsigned s)
 {
+	unsigned is_byte = (n->flags & (BYTETAIL | BYTEOP)) == (BYTETAIL | BYTEOP);
 	const char *name;
 	unsigned v = n->value;
 
+	if (s == 4)
+		return 0;
+
 	switch(n->type) {
 	case T_CONSTANT:
+		if (is_byte)
+			s = 1;
 		invalidate_ea();
 		if (s == 1)
 			printf("\t%s a,=%u\n", op, v & 0xFF);
@@ -1086,14 +1291,18 @@ static unsigned op_direct(struct node *n, const char *op, unsigned s)
 			printf("\t%s ea,=%u\n", op, v & 0xFFFF);
 		return 1;
 	case T_NAME:
+		if (is_byte)
+			s = 1;
 		invalidate_ea();
 		name = namestr(n->snum);
 		if (s == 1)
 			printf("\t%s a,=<%s+%u\n", op, name, v);
-		else 
+		else
 			printf("\t%s, ea,=%s+%u\n", op, name, v);
 		return 1;
 	case T_LABEL:
+		if (is_byte)
+			s = 1;
 		invalidate_ea();
 		if (s == 1)
 			printf("\t%s a,=<T%u+%u\n", op, n->val2, v);
@@ -1101,6 +1310,8 @@ static unsigned op_direct(struct node *n, const char *op, unsigned s)
 			printf("\t%s ea,=T%u+%u\n", op, n->val2, v);
 		return 1;
 	case T_LREF:
+		if (is_byte)
+			s = 1;
 		/* Not always possible */
 		if (v + sp > 128 - s) {
 			/* TODO: swap via T ? */
@@ -1120,6 +1331,9 @@ static unsigned op_direct8(struct node *n, const char *op, unsigned s)
 {
 	const char *name;
 	unsigned v = n->value;
+
+	if (s == 4)
+		return 0;
 
 	switch(n->type) {
 	case T_CONSTANT:
@@ -1170,7 +1384,7 @@ static unsigned op_direct8(struct node *n, const char *op, unsigned s)
 
 /* EA holds the left side (ptr) r is the value to handle. Do not use
    T as T is used by caller in postinc/dec usage
-   
+
    Needs work to use ILD/DLD and postinc/predec auto index forms */
 unsigned do_preincdec(unsigned sz, struct node *n, unsigned save)
 {
@@ -1215,11 +1429,13 @@ unsigned do_preincdec(unsigned sz, struct node *n, unsigned save)
 
 	gen_load_nw(r, ptr, 0);
 
-	if (save)
+	if (save) {
+		invalidate_t();
 		printf("\tld t,0,p%u\n", ptr);
+	}
 
 	/* A or EA now holds the data */
-	/* Now add to 0,ptr */	
+	/* Now add to 0,ptr */
 	if (sz == 1)
 		printf("\tadd a,0,p%d\n\tst a,0,p%d\n",
 			ptr, ptr);
@@ -1229,7 +1445,7 @@ unsigned do_preincdec(unsigned sz, struct node *n, unsigned save)
 		set_ea_node(r);
 	}
 	if (save) {
-		printf("\tld ea,t\n");
+		load_ea_t();
 		invalidate_ea();
 	}
 	return 1;
@@ -1252,6 +1468,8 @@ unsigned gen_direct(struct node *n)
 	unsigned ptr, ptr2;
 	int off;
 	char *op;
+	unsigned se = n->flags & SIDEEFFECT;
+
 	if (r)
 		v = r->value;
 
@@ -1268,11 +1486,15 @@ unsigned gen_direct(struct node *n)
 		return 1;
 	case T_NSTORE:
 	case T_LBSTORE:
+		/* TODO: can do 4 sanely */
+		if (s > 2)
+			return 0;
+		if (!se && is_ea_node(n))
+			return 1;
 		if (s <= 2 && gen_op(s, "st", r)) {
-			set_ea_node(r);
+			set_ea_node(n);
 			return 1;
 		}
-		/* TODO: can do 4 sanely */
 		break;
 	case T_EQ:
 		n->value = 0;
@@ -1293,16 +1515,16 @@ unsigned gen_direct(struct node *n)
 		v = WORD(n->value);
 		if (s == 4) {
 			if (!(n->flags & NORETURN))
-				printf("\tld t,ea");
+				load_t_ea();
 			printf("\tst ea,%u,p%d\n", v, ptr);
+			/* TODO save EA node correctly */
+			invalidate_ea();
 			printf("\tld ea,:__hireg\n\tst ea,%u,p%d\n", v + 2, ptr);
-			if (!(n->flags & NORETURN)) {
-				printf("\tld ea,t\n");
-				invalidate_t();
-			} else
+			if (!(n->flags & NORETURN))
+				load_ea_t();
+			else
 				invalidate_ea();
-		}
-		if (s == 2)
+		} else if (s == 2)
 			printf("\tst ea,%u,p%d\n", v, ptr);
 		else
 			printf("\tst a,%u,p%d\n", v, ptr);
@@ -1314,7 +1536,7 @@ unsigned gen_direct(struct node *n)
 		if (r->op == T_CONSTANT) {
 			if (v == 0)
 				return 1;
-			if (s == 1) { 
+			if (s == 1) {
 				printf("\tadd a,=%u\n", v & 0xFF);
 				adjust_a(v);
 			} else {
@@ -1336,7 +1558,7 @@ unsigned gen_direct(struct node *n)
 			if (s == 1) {
 				printf("\tsub a,=%u\n", v & 0xFF);
 				adjust_a(-v);
-			} else { 
+			} else {
 				printf("\tsub ea,=%u\n", v);
 				adjust_ea(-v);
 			}
@@ -1355,7 +1577,7 @@ unsigned gen_direct(struct node *n)
 				return 1;
 		}
 		invalidate_t();
-		puts("\tld t,ea");
+		load_t_ea();
 		gen_load(r);
 		/* MPY requires one side is 0 top bit sigh */
 		puts("\tjsr __mpyfix");
@@ -1366,17 +1588,20 @@ unsigned gen_direct(struct node *n)
 			return 0;
 		if (r->op == T_CONSTANT) {
 			if (s == 2 && (r->type & UNSIGNED) && r->op == T_CONSTANT && v == 256) {
-				puts("\tld a,=0\n\txch a,e");
+				load_ea(1,0);
+				puts("\txch a,e");
 				return 1;
 			}
-#if 0			
+#if 0
 			if (gen_fast_div(s, r))
 				return 1;
-#endif		
+#endif
 			/* Can we use the div instruction ? */
 			/* This is true only for unsigned and positvie
 			    divisor */
 			if ((n->type & UNSIGNED) && !(v & 0x8000)) {
+				invalidate_t();
+				invalidate_ea();
 				printf("\tld t,=%u\n\tdiv ea,t\n", v);
 				return 1;
 			}
@@ -1385,7 +1610,7 @@ unsigned gen_direct(struct node *n)
 	case T_PERCENT:
 		/* Mod 256 we can do easily */
 		if (s == 2 && (r->type & UNSIGNED) && r->op == T_CONSTANT && v == 256) {
-			puts("\txch a,e\n\tld a,=0\n\txch a,e");
+			load_e(0);
 			return 1;
 		}
 		break;
@@ -1434,7 +1659,7 @@ unsigned gen_direct(struct node *n)
 	case T_HAT:
 		if (r->op == T_CONSTANT && s <= 2) {
 			if (s == 2) {
-				if (v & 0xFF00) { 
+				if (v & 0xFF00) {
 					printf("\txch e,a\n\txor a,=%u\n\txch e,a\n", v >> 8);
 					invalidate_e();
 				}
@@ -1459,6 +1684,25 @@ unsigned gen_direct(struct node *n)
 	case T_LT:
 		return 0;
 	case T_BANGEQ:
+		if (r->type == T_CONSTANT) {
+			s = get_size(r->type);
+			if (s > 2)
+				return 0;
+			if (r->value == 0) {
+				if (s == 2)
+					puts("\tor a,e\n");
+			} else {
+				if (s == 1)
+					printf("\tsub a,=%u\n", BYTE(r->value));
+				else
+					printf("\tsub ea,=%u\n", WORD(r->value));
+			}
+			printf("\tbz X%u\n", ++label);
+			load_ea(2,1);
+			printf("X%u:\n", label);
+			n->flags |= ISBOOL;
+			return 1;
+		}
 		return 0;
 	case T_LTLT:
 		if (s > 2)
@@ -1518,7 +1762,7 @@ unsigned gen_direct(struct node *n)
 		op = "or";
 		goto doeleq;
 	case T_HATEQ:
-		op = "xor";	
+		op = "xor";
 	doeleq:
 		/* EA holds the pointer */
 		if (s > 2)
@@ -1599,12 +1843,15 @@ unsigned gen_shortcut(struct node *n)
 		codegen_lr(r);
 		return 1;
 	}
-	if ((n->op == T_NSTORE || n->op == T_LSTORE) && s < 2) {
+	if ((n->op == T_NSTORE || n->op == T_LBSTORE || n->op == T_LSTORE) && s <= 2) {
 		codegen_lr(r);
 		/* Result is now in EA */
 		ptr = gen_ref(n, &off);
-		if (ptr == 0)
+		if (ptr == 0) {
+			/* FIXME: we've generated code this can't fail */
+			error("nstea");
 			return 0;
+		}
 		/* Ptr loaded */
 		if (s == 2)
 			printf("\tst ea,%d,p%u\n", off, ptr);
@@ -1613,6 +1860,7 @@ unsigned gen_shortcut(struct node *n)
 		set_ea_node(n);
 		return 1;
 	}
+	/* TODO: size 1 on these */
 	/* PLUSPLUS is preinc and always constant */
 	if (n->op == T_PLUSPLUS) {
 		if (s != 2)
@@ -1623,17 +1871,29 @@ unsigned gen_shortcut(struct node *n)
 			return 0;
 		/* Ok we can construct a pointer to the left */
 		if (s == 2) {
+			invalidate_ea();
+#if 0
+			/* We can do the common ++ case neatly */
+			if (WORD(r->value) == 1) {
+				printf("\tisz %,p%u\nbnz X%u\n", off, ptr, ++label);
+				if (noret)
+					printf("isz %d,p%u\n",
+						off + 1, ptr);
+				else
+					printf("xch a,e\n\tisz %d,p%u\n\txch a,e\n",
+						off + 1, ptr);
+				printf("X%u\n", label);
+				return 1;
+			}
+#endif
 			printf(";plusplus short\n");
 			printf("\tld ea,%d,p%u\n", off, ptr);
 			if (!noret)
-				printf("\tld t,ea\n");
+				load_t_ea();
 			printf("\tadd ea,=%u\n\tst ea,%d,p%u\n", WORD(r->value), off, ptr);
-			if (!noret) {
-				printf("\tld ea,t\n");
-				invalidate_t();
-			}
+			if (!noret)
+				load_ea_t();
 			/* TODO: again need a set_ea_node with offset */
-			invalidate_ea();
 			return 1;
 		}
 		/* TODO size 1 and also use ILD/DLD for it */
@@ -1648,15 +1908,14 @@ unsigned gen_shortcut(struct node *n)
 			return 0;
 		/* Ok we can construct a pointer to the left */
 		if (s == 2) {
+			invalidate_ea();
 			printf("\tld ea,%d,p%u\n", off, ptr);
 			if (!noret)
-				printf("\tld t,ea\n");
+				load_t_ea();
 			printf("\tsub ea,=%u\n\tst ea,%d,p%u\n", WORD(r->value), off, ptr);
-			if (!noret) {
-				printf("\tld ea,t\n");
-				invalidate_t();
-			}
 			invalidate_ea();
+			if (!noret)
+				load_ea_t();
 			return 1;
 		}
 		/* TODO size 1 and also use ILD/DLD for it */
@@ -1714,6 +1973,10 @@ static unsigned gen_cast(struct node *n)
 	/* Floats and stuff handled by helper */
 	if (!IS_INTARITH(lt) || !IS_INTARITH(rt))
 		return 0;
+
+	/* No type casting needed as computing byte sized */
+	if (n->flags & BYTEOP)
+		return 1;
 
 	ls = get_size(lt);
 
@@ -1780,11 +2043,14 @@ static unsigned logic_ptr_op(const char *op, unsigned sz)
 
 unsigned gen_node(struct node *n)
 {
+	struct node *r = n->right;
 	unsigned sz = get_size(n->type);
 	unsigned v;
 	unsigned ptr;
 	int off;
 	unsigned noret = n->flags & NORETURN;
+	unsigned is_byte = (n->flags & (BYTETAIL | BYTEOP)) == (BYTETAIL | BYTEOP);
+	unsigned se = n->flags & SIDEEFFECT;
 
 	/* We adjust sp so track the pre-adjustment one too when we need it */
 
@@ -1803,13 +2069,16 @@ unsigned gen_node(struct node *n)
 		/* We need a pointer to all objects so these come out
 		   the same */
 	case T_LREF:
-		/* Kill unused local ref */
-		if (noret)
-			return 1;
-		/* TODO: once volatile is cleaned up a bit more kill these
-		   too */
 	case T_NREF:
 	case T_LBREF:
+		/* Kill unused ref if non volatile */
+		if (noret && !se)
+			return 1;
+		printf(";SE %u for ref\n", se);
+		/* Already loaded and not volatile */
+		if (!se && is_ea_node(n))
+			return 1;
+		/* TODO: check if !se and already holds the value */
 		ptr = gen_ref(n, &off);
 		if (ptr == 0)
 			return 0;
@@ -1818,8 +2087,9 @@ unsigned gen_node(struct node *n)
 		if (sz == 2)
 			printf("\tld ea,%d,p%d\n", off, ptr);
 		if (sz == 4) {
-			printf("\tld ea,%d+2,p%d\n",off, ptr);
-			puts("\tst ea,:__hireg");
+			invalidate_ea();
+			printf("\tld ea,%d,p%d\n", off + 2, ptr);
+			store_ea_hireg();
 			printf("\tld ea,%d,p%d\n", off, ptr);
 		}
 		set_ea_node(n);
@@ -1827,6 +2097,9 @@ unsigned gen_node(struct node *n)
 	case T_LSTORE:
 	case T_NSTORE:
 	case T_LBSTORE:
+		/* Already stored and not volatile */
+		if (!se && is_ea_node(n))
+			return 1;
 		ptr = gen_ref(n, &off);
 		if (ptr == 0)
 			return 0;
@@ -1835,11 +2108,16 @@ unsigned gen_node(struct node *n)
 		if (sz == 2)
 			printf("\tst ea,%d,p%d\n", off, ptr);
 		if (sz == 4) {
-			puts("\tld t,ea");
-			puts("\tld ea,:__hireg");
-			printf("\tst ea,%d+2,p%d\n",off, ptr);
-			puts("\tld ea,t");
 			printf("\tst ea,%d,p%d\n", off, ptr);
+			if (!noret)
+				load_t_ea();
+			load_ea_hireg();
+			printf("\tst ea,%d,p%d\n", off + 2, ptr);
+			if (!noret) {
+				load_ea_t();
+				set_ea_node(n);
+			}
+			return 1;
 		}
 		set_ea_node(n);
 		return 1;
@@ -1862,17 +2140,24 @@ unsigned gen_node(struct node *n)
 			printf("\tst ea,%u,p%d\n", off, ptr);
 			if (sz == 4) {
 				if (!noret)
-					puts("\tld t,ea\n");
+					load_t_ea();
 				puts("\tld ea,:__hireg");
 				printf("\tst ea,%u,p%d\n", off + 2, ptr);
-				if (!noret) {
-					puts("\tld ea,t\n");
-				}
+				invalidate_ea();
+				if (!noret)
+					load_ea_t();
 			}
 		}
 		return 1;
 	case T_DEREF:
 	case T_DEREFPLUS:
+		/* This is an odd one. We can't randomly assume a deref is
+		   safe to do byte size if forced bytesize if the source is
+		   volatile */
+		if (noret && !se)
+			return 1;
+		if (!se && is_byte)
+			sz = 1;
 		/* Might be able to be smarter here */
 		flush_writeback();
 		/* Could noret away once volatile cleaned */
@@ -1883,52 +2168,59 @@ unsigned gen_node(struct node *n)
 		else if (sz == 2)
 			printf("\tld ea,%u,p%d\n", v, ptr);
 		else {
+			invalidate_ea();
 			printf("\tld ea,%u,p%d\n", v + 2, ptr);
-			puts("\tst ea,:__hireg");
+			store_ea_hireg();
 			printf("\tld ea,%u,p%d\n", v, ptr);
 		}
 		/* TODO node track */
 		invalidate_ea();
 		return 1;
 	case T_LDEREF:
+		/* TODO: review for volatile byteable */
 		/* val2 offset of variable, val offset of ptr */
 		ptr = free_pointer();
 		/* We cannot alas do a straight ptr of ptr load, but must
 		   go via EA. No problem here as we will trash EA anyway */
-		printf("\tld ea,%u,p1\n\tld p%u,ea\n", v + sp, ptr);
+		printf("\tld ea,%u,p1\n", v + sp);
+		ptr = load_ptr_ea();
 		invalidate_p(ptr);
+		invalidate_ea();
 		if (sz == 1)
 			printf("\tld a,%u,p%u\n", n->val2, ptr);
 		else if (sz == 2)
 			printf("\tld ea,%u,p%u\n", n->val2, ptr);
 		else {
 			printf("\tld ea,%u,p%u\n", n->val2 + 2, ptr);
-			printf("\tst ea,:__hireg\n");
+			store_ea_hireg();
 			printf("\tld ea,%u,p%u\n", n->val2, ptr);
 		}
 		/* TODO node track */
-		invalidate_ea();
 		return 1;
 	case T_LEQ:
+		/* TODO: review for volatile byteable */
 		printf(";leq\n");
 		/* Same idea for writing */
 		ptr = free_pointer();
 		/* Must go via EA which is messier because of course
 		   we have a value in EA right now */
-		printf("\tld t,ea\n\tld ea,%u,p1\n\tld p%u,ea\n\tld ea,t\n", v + sp, ptr);
-		invalidate_p(ptr);
+		load_t_ea();
+		printf("\tld ea,%u,p1\n", v + sp);
+		invalidate_ea();
+		ptr = load_ptr_ea();
+		load_ea_t();
 		if (sz == 1)
 			printf("\tst a,%u,p%u\n", n->val2, ptr);
 		else if (sz == 2)
 			printf("\tst ea,%u,p%u\n", n->val2, ptr);
 		else {
 			if (!noret)
-				printf("\tld t,ea\n");
+				load_t_ea();
 			printf("\tst ea,%u,p%u\n", n->val2, ptr);
-			printf("\tld ea,:__hireg\n");
+			load_ea_hireg();
 			printf("\tst ea,%u,p%u\n", n->val2 + 2, ptr);
 			if (!noret)
-				printf("\tld ea,t\n");
+				load_ea_t();
 		}
 		/* TODO node track */
 		invalidate_ea();
@@ -1940,25 +2232,27 @@ unsigned gen_node(struct node *n)
 		puts("\tjsr __callea\n");
 		return 1;
 	case T_LABEL:
-		printf("\tld ea,=T%d+%d\n", n->val2, v);
-		set_ea_node(n);
+		if (is_byte || sz == 1) {
+			printf("\tld a,=<T%d+%d\n", n->val2, v);
+			invalidate_a();
+		} else {
+			printf("\tld ea,=T%d+%d\n", n->val2, v);
+			set_ea_node(n);
+		}
 		return 1;
 	case T_CONSTANT:
-		if (sz == 4) {
-			printf("\tld ea,=%d\n", v >> 16);
-			puts("\tst ea,:__hireg");
-		}
-		if (sz > 1) {
-			printf("\tld ea,=%d\n", v & 0xFFFF);
-			set_ea(v & 0xFFFF);
-		} else	{
-			printf("\tld a,=%d\n", v & 0xFF);
-			set_a(v & 0xFF);
-		}
+		if (is_byte)
+			sz = 1;
+		load_ea(sz, n->value);
 		return 1;
 	case T_NAME:
-		printf("\tld ea,=_%s+%d\n", namestr(n->snum), v);
-		set_ea_node(n);
+		if (is_byte || sz == 1) {
+			printf("\tld a,=<_%s+%d\n", namestr(n->snum), v);
+			invalidate_a();
+		} else {
+			printf("\tld ea,=_%s+%d\n", namestr(n->snum), v);
+			set_ea_node(n);
+		}
 		return 1;
 	case T_ARGUMENT:
 		v += frame_len + ARGBASE;
@@ -1986,10 +2280,10 @@ unsigned gen_node(struct node *n)
 		}
 		return 0;
 	case T_NEGATE:
-		if (sz == 1) {	
+		if (sz == 1) {
 			if (a_valid)
 				set_a(-a_value);
-			puts("\txor a,=255\n\tadd a,=1");  
+			puts("\txor a,=255\n\tadd a,=1");
 			return 1;
 		}
 		if (sz == 2) {
@@ -2039,6 +2333,29 @@ unsigned gen_node(struct node *n)
 		return logic_sp_op(n, "or");
 	case T_HAT:
 		return logic_sp_op(n, "xor");
+	case T_BANG:
+		/* Common case of !(boolstuff) */
+		if (n->right->flags & ISBOOL) {
+			n->flags |= ISBOOL;
+			puts("\txor a,=1");
+			/* Can't be a pointer as is bool */
+			a_value ^= 1;
+			return 1;
+		}
+		return 0;
+	case T_BOOL:
+		n->flags |= ISBOOL;
+		if (n->right->flags & ISBOOL)
+			return 1;
+		sz = get_size(r->type);
+		if (sz > 2)
+			return 0;
+		if (sz == 2)
+			puts("\tor a,e");
+		printf("\tbz X%u\n", ++label);
+		load_ea(2, 1);
+		printf("X%u:\n", label);
+		return 1;
 	/* Shift TOS by EA */
 	case T_LTLT:
 		return 0;

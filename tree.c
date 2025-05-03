@@ -185,6 +185,8 @@ unsigned is_constant_zero(struct node *n)
 	return 0;
 }
 
+#if 0
+/* Not yet used */
 
 #define IS_NAME(x)		((x) >= T_NAME && (x) <= T_ARGUMENT)
 
@@ -209,6 +211,7 @@ static unsigned transitive(register unsigned op)
 		return 1;
 	return 0;
 }
+#endif
 
 struct node *make_rval(register struct node *n)
 {
@@ -366,6 +369,18 @@ struct node *arith_tree(unsigned op, struct node *l, struct node *r)
 	return arith_pro_tree(op, l, r);
 }
 
+struct node *arith_uni_tree(unsigned op, struct node *r)
+{
+	/* ~ and - implicitly like other arith ops work on integers if
+	   shorter */
+	unsigned t = type_canonical(r->type);
+	if (t < CINT) {
+		r = make_cast(r, CINT);
+		t = CINT;
+	}
+	return typed_tree(op, t, NULL, r);
+}
+
 /* Two argument integer or bit pattern
    << >> & | ^ */
 struct node *intarith_tree(register unsigned op, register struct node *l, register struct node *r)
@@ -377,8 +392,10 @@ struct node *intarith_tree(register unsigned op, register struct node *l, regist
 	if (op == T_LTLT || op == T_GTGT) {
 		/* Promote the left side if needed be (eg it's char/uchar) */
 		rt = arith_pro(lt, lt);
-		if (lt != rt)
+		if (lt != rt) {
 			l = make_cast(l, rt);
+			lt = rt;
+		}
 		return typed_tree(op, lt, l, make_cast(r, CINT));
 	} else
 		return arith_pro_tree(op, l, r);
@@ -445,17 +462,22 @@ unsigned long trim_constant(unsigned t, unsigned long value, unsigned warn)
 			value = -value;
 		}
 	}
+	/* Pointer casting can mean we get pointer types here */
+	if (PTR(t))
+		t = target_ptr_arith(t);
 	/* Now trim the unsigned bit pattern */
 	switch(t & 0xF0) {
-	case UCHAR:
+	case CCHAR:
 		value &= TARGET_CHAR_MASK;
 		break;
-	case USHORT:
+	case CSHORT:
 		value &= TARGET_SHORT_MASK;
 		break;
-	case ULONG:
+	case CLONG:
 		value &= TARGET_LONG_MASK;
 		break;
+	default:
+		error("trim");
 	}
 	/* And do the range check */
 	if (warn && ov != value)
