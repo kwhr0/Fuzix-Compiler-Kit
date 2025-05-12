@@ -35,14 +35,24 @@ uint8_t i8085_inport(uint8_t port)
 
 void i8085_outport(uint8_t port, uint8_t value)
 {
+    static uint8_t lo;
+    int x;
+
     switch(port) {
+    case 0xFC:
+        lo = value;
+        break;
     case 0xFD:
-        if (value < 32 || value > 127)
-            printf("\\x%02X", value);
-        else
-            putchar(value);
+        x = (value << 8) | lo;
+        if (x >= 0x8000)
+            x -= 0x10000;
+        printf("%d\n", x);
         fflush(stdout);
-        return;
+        break;
+    case 0xFE:
+        putchar(value);
+        fflush(stdout);
+        break;
     case 0xFF:
         if (value)
             fprintf(stderr, "***FAIL %d\n", value);
@@ -86,7 +96,7 @@ int main(int argc, char *argv[])
     }
     close(fd);
     i8085_load_symbols(argv[2]);
-    i8085_reset(0);
+    i8085_reset();
     while(1)
         i8085_exec(100000);
 }
